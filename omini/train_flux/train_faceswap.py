@@ -1,4 +1,5 @@
 import torch
+torch.set_float32_matmul_precision('medium')
 from torch.utils.data import Dataset
 import torchvision.transforms as T
 import os
@@ -21,7 +22,8 @@ import diffusers
 diffusers.utils.logging.set_verbosity_error()
 
 import cv2
-
+from .blur import create_condition_images
+from natsort import natsorted
 
 
 '''
@@ -167,6 +169,10 @@ class VGGDataset(torch.utils.data.Dataset):
         do_proxy_recon_task = False,
         do_proxy_recon_task_prob = 0.5,
         model = None,
+        degradation_type = 'downsample', # 'blur' or 'downsample'
+        downsample_size = 8,
+        blur_radius = 64,
+        
     ):
         # 예시) /mnt/data2/dataset/VGGface2_None_norm_512_true_bygfpgan/n000002/0001_01.jpg
         # 예시) /mnt/data2/dataset/VGGface2_None_norm_512_true_bygfpgan/n000002/masked_pulid_id/0001_01.npy
@@ -192,14 +198,18 @@ class VGGDataset(torch.utils.data.Dataset):
         self.do_proxy_recon_task = do_proxy_recon_task
         self.do_proxy_recon_task_prob = do_proxy_recon_task_prob
         self.model = model
+        self.pseudo = pseudo
+        self.degradation_type = degradation_type
+        self.downsample_size = downsample_size
+        self.blur_radius = blur_radius
         random.seed(0) # Seed for reproducibility
         
         
         
-        if not pseudo:
+        if not self.pseudo:
             print("[INFO] 1st Stage Training: Using real dataset with for VGGDataset")
             
-            # 1) AES Score 기준으로 필터링
+            # 1) Target 준비 : AES Score 기준으로 필터링
             import json
             json_path = os.path.join(dataset_path, 'score.json')
             with open(json_path, 'r') as f:
@@ -213,14 +223,26 @@ class VGGDataset(torch.utils.data.Dataset):
             # img_list = natsorted(img_list)[:1000] # for debugging, limit to 1000 images
             print(f"Filtered images based on AES score > {aes_thres}: {len(img_list)} images remain.")
 
+            dirname_list = [os.path.dirname(f).split('/')[-1] for f in img_list] # e.g. n000002, # Target
+            basename_list = [os.path.basename(f).split('.')[0] for f in img_list] # e.g. 0001_01# Target
+            img_list_checked = []
+            for num, (dirname, basename) in enumerate(zip(dirname_list, basename_list)):
+                id = dirname # e.g. n000002
+                trg_basename = basename # e.g. 0001_01
+                mask_path = os.path.join(self.dataset_path, id, 'mask_intersection', f"{trg_basename}.png")
+                seg_path = os.path.join(self.dataset_path, id, 'segmap_intersection', f"{trg_basename}.png")
+                landmark_path = os.path.join(self.dataset_path, id, '3dmm', trg_basename, f"{trg_basename}_ldm68.png")
+                iris_path = os.path.join(self.dataset_path, id, 'iris', f"{trg_basename}.png")
+                if os.path.exists(mask_path) and os.path.exists(seg_path) and os.path.exists(landmark_path) and os.path.exists(iris_path):
+                    img_list_checked.append(os.path.join(dataset_path, dirname, f"{basename}.jpg"))
+            
+            img_list = img_list_checked
             random.shuffle(img_list)
             if mode == 'train':
                 img_list = img_list[:-num_validation]
             else:
                 img_list = img_list[-num_validation:]
 
-            dirname_list = [os.path.dirname(f).split('/')[-1] for f in img_list] # e.g. n000002, # Target
-            basename_list = [os.path.basename(f).split('.')[0] for f in img_list] # e.g. 0001_01# Target
 
             gaze_paths = None
             if train_gaze:
@@ -240,76 +262,86 @@ class VGGDataset(torch.utils.data.Dataset):
                     if not os.path.exists(gaze_path):
                         raise ValueError(f"Gaze path does not exist: {gaze_path}")
 
-
-            # 3) Source의 Image 및 ID embed 설정
-            # target과 동일한 인물 내에서 랜덤하게 하나 선택
-            src_img_list = []
-            id_embed_list = []
-            effective_dirname_list = []
-            effective_basename_list = []
-            if id_embed_candidates_cache is None:
-                id_embed_candidates_cache = {} # 캐시
-                for dirname in tqdm(set(dirname_list), desc="Caching ID embed candidates"):
+            if not self.get_random_id_embed_every_step:
+                # 3) Source의 Image 및 ID embed 설정
+                # target과 동일한 인물 내에서 랜덤하게 하나 선택
+                src_img_list = []
+                src_mask_list = []
+                src_seg_list = []
+                id_embed_list = []
+                effective_dirname_list = []
+                effective_basename_list = []
+                
+                
+                if id_embed_candidates_cache is None:
+                    id_embed_candidates_cache = {} # 캐시
+                    for dirname in tqdm(set(dirname_list), desc="Caching ID embed candidates"):
+                        id = dirname # e.g. n000002
+                        id_embed_candidates = glob(os.path.join(dataset_path, id, id_dirname, '*.npy')) #
+                        id_embed_candidates_cache[id] = id_embed_candidates
+                
+                ############ Source의 ID임베딩이 존재하는 경우에 한해서, 1) Source의 ID 임베딩 2) Source 이미지 ############
+                for num, (dirname, basename) in enumerate(zip(dirname_list, basename_list)):
                     id = dirname # e.g. n000002
-                    id_embed_candidates = glob(os.path.join(dataset_path, id, id_dirname, '*.npy')) #
-                    id_embed_candidates_cache[id] = id_embed_candidates
-            for num, (dirname, basename) in enumerate(zip(dirname_list, basename_list)):
-                id = dirname # e.g. n000002
-                if mode == 'test' and self.validation_with_other_src_id_embed:
-                    # validation_with_other_src_id_embed -> Test 시에는 자기 자신 제외한 다른 인물에서 선택
-                    print("[INFO] Validation with other src ID embed enabled. Validation by FaceSwap setting for 1st Stage.")
-                    random.seed(num) # Seed for reproducibility
-                    id = random.choice([d for d in natsorted(list(id_embed_candidates_cache.keys())) if d != id]) # test 시에는 자기 자신 제외한 다른 인물에서 선택
-                    id_embed_candidates = id_embed_candidates_cache.get(id, []) 
-                    print(f"[DEBUG] For target ID {dirname}, selected src ID {id} with {len(id_embed_candidates)} candidates.")
-                    if len(id_embed_candidates) == 0:
-                        print (f"[WARN] No ID embed candidates found for {id}, skipping sample.")
-                        continue
+                    if mode == 'test' and self.validation_with_other_src_id_embed:
+                        # validation_with_other_src_id_embed -> Test 시에는 자기 자신 제외한 다른 인물에서 선택
+                        print("[INFO] Validation with other src ID embed enabled. Validation by FaceSwap setting for 1st Stage.")
+                        random.seed(num) # Seed for reproducibility
+                        id = random.choice([d for d in natsorted(list(id_embed_candidates_cache.keys())) if d != id]) # test 시에는 자기 자신 제외한 다른 인물에서 선택
+                        id_embed_candidates = id_embed_candidates_cache.get(id, []) 
+                        print(f"[DEBUG] For target ID {dirname}, selected src ID {id} with {len(id_embed_candidates)} candidates.")
+                        if len(id_embed_candidates) == 0:
+                            print (f"[WARN] No ID embed candidates found for {id}, skipping sample.")
+                            continue
+                        else :
+                            effective_dirname_list.append(dirname)
+                            effective_basename_list.append(basename)
+                            random.seed(num) # Seed for reproducibility 
+                            selected_id_embed = random.choice(id_embed_candidates) # 해당 ID 내에서 랜덤하게 ID Embed 선택
+                            id_embed_list.append(selected_id_embed) 
+                            src_img_list.append(os.path.join(dataset_path, id, os.path.basename(selected_id_embed).replace('.npy', '.jpg'))) # 해당 ID embed에 대응하는 이미지
                     else :
-                        effective_dirname_list.append(dirname)
-                        effective_basename_list.append(basename)
-                        random.seed(num) # Seed for reproducibility 
-                        selected_id_embed = random.choice(id_embed_candidates) # 해당 ID 내에서 랜덤하게 ID Embed 선택
-                        id_embed_list.append(selected_id_embed) 
-                        src_img_list.append(os.path.join(dataset_path, id, os.path.basename(selected_id_embed).replace('.npy', '.jpg'))) # 해당 ID embed에 대응하는 이미지
-                else :
-                    # 정상적으로 로딩, train 시에는 target과 동일 인물 내에서 선택
-                    id_embed_candidates = id_embed_candidates_cache.get(id, [])
-                    if len(id_embed_candidates) == 0:
-                        print (f"[WARN] No ID embed candidates found for {id}, skipping sample.")
-                        continue
-                    else :
-                        effective_dirname_list.append(dirname)
-                        effective_basename_list.append(basename)
-                        selected_id_embed = random.choice(id_embed_candidates) # 해당 ID 내에서 랜덤하게 ID Embed 선택
-                        id_embed_list.append(selected_id_embed) 
-                        src_img_list.append(os.path.join(dataset_path, dirname, os.path.basename(selected_id_embed).replace('.npy', '.jpg'))) # 해당 ID embed에 대응하는 이미지
-            dirname_list = effective_dirname_list
-            basename_list = effective_basename_list
-            img_list = [os.path.join(dataset_path, dirname, f"{basename}.jpg") for (dirname, basename) in zip(dirname_list, basename_list)]
+                        # 정상적으로 로딩, train 시에는 target과 동일 인물 내에서 선택
+                        id_embed_candidates = id_embed_candidates_cache.get(id, [])
+                        if len(id_embed_candidates) == 0:
+                            print (f"[WARN] No ID embed candidates found for {id}, skipping sample.")
+                            continue
+                        else :
+                            effective_dirname_list.append(dirname)
+                            effective_basename_list.append(basename)
+                            selected_id_embed = random.choice(id_embed_candidates) # 해당 ID 내에서 랜덤하게 ID Embed 선택
+                            id_embed_list.append(selected_id_embed) 
+                            src_img_list.append(os.path.join(dataset_path, dirname, os.path.basename(selected_id_embed).replace('.npy', '.jpg'))) # 해당 ID embed에 대응하는 이미지
+                
+                dirname_list = effective_dirname_list
+                basename_list = effective_basename_list
+                img_list = [os.path.join(dataset_path, dirname, f"{basename}.jpg") for (dirname, basename) in zip(dirname_list, basename_list)]
 
-            uncond_id_embed_path = os.path.join(dataset_path, 'n000002/pulid_id/uncond.npy')
-            condition_list = [os.path.join(dataset_path, dirname, condition_type, basename + '.png') for (dirname, basename) in zip(dirname_list, basename_list)]
+                uncond_id_embed_path = os.path.join(dataset_path, 'n000002/pulid_id/uncond.npy')
+                condition_list = [os.path.join(dataset_path, dirname, condition_type, basename + '.png') for (dirname, basename) in zip(dirname_list, basename_list)]
 
-            # 최종 셋팅
-            self.src_img_list = src_img_list
-            self.image_paths = img_list
-            self.id_embed_paths = id_embed_list
-            self.controlnet_paths = condition_list
-            self.gaze_paths = gaze_paths
+                # 최종 셋팅
+                self.src_img_list = src_img_list
+                self.image_paths = img_list
+                self.id_embed_paths = id_embed_list
+                self.controlnet_paths = condition_list
+                self.gaze_paths = gaze_paths
 
-            # # DEBUG 5개씩
-            # print(f"[DEBUG] Sample src_img_list : {self.src_img_list[:5]}")
-            # print(f"[DEBUG] Sample image_paths : {self.image_paths[:5]}")
-            # print(f"[DEBUG] Sample id_embed_paths : {self.id_embed_paths[:5]}")
-            # print(f"[DEBUG] Sample controlnet_paths : {self.controlnet_paths[:5]}")
-            # if gaze_paths is not None:
-            #     print(f"[DEBUG] Sample gaze_paths : {self.gaze_paths[:5]}")
-            
-            self.uncond_id_embed = torch.Tensor(np.load(uncond_id_embed_path))
+                # # DEBUG 5개씩
+                # print(f"[DEBUG] Sample src_img_list : {self.src_img_list[:5]}")
+                # print(f"[DEBUG] Sample image_paths : {self.image_paths[:5]}")
+                # print(f"[DEBUG] Sample id_embed_paths : {self.id_embed_paths[:5]}")
+                # print(f"[DEBUG] Sample controlnet_paths : {self.controlnet_paths[:5]}")
+                # if gaze_paths is not None:
+                #     print(f"[DEBUG] Sample gaze_paths : {self.gaze_paths[:5]}")
+                
+                self.uncond_id_embed = torch.Tensor(np.load(uncond_id_embed_path))
 
-            assert len(self.image_paths) == len(self.id_embed_paths)
-            assert len(self.image_paths) == len(self.controlnet_paths)
+                assert len(self.image_paths) == len(self.id_embed_paths)
+                assert len(self.image_paths) == len(self.controlnet_paths)
+            else :
+                self.image_paths = img_list # ID 임베딩 및 Src 이미지는 매 스텝마다 랜덤하게 선택하므로 여기서는 일단 Target 이미지 경로만 설정
+
 
             print(f"[INFO] Real dataset size: {len(self.image_paths)} images.")
         else :
@@ -380,6 +412,8 @@ class VGGDataset(torch.utils.data.Dataset):
                 for trg_id in tqdm(set(trg_ids)): # 캐싱
                     id_embed_candidates = glob(os.path.join(dataset_path, trg_id, id_dirname, '*.npy')) #
                     id_embed_candidates_cache[trg_id] = id_embed_candidates
+                    
+                    
             for idx, (trg_id, trg_num) in tqdm(enumerate(zip(trg_ids, trg_nums)), desc="Preparing pseudo dataset"):
                 id_embed_candidates = id_embed_candidates_cache[trg_id]
                 # 자기 자신 제외
@@ -438,61 +472,120 @@ class VGGDataset(torch.utils.data.Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        while True:
-            try:
-                # Processing
-                src_img = Image.open(self.src_img_list[idx]).convert('RGB')
-                src_img_basename = os.path.basename(self.src_img_list[idx]).split('.')[0] # e.g. 0001_01
-                img = Image.open(self.image_paths[idx]).convert('RGB') # GT target
-                controlnet_img = Image.open(self.controlnet_paths[idx]).convert('RGB')
-                if self.do_proxy_recon_task and self.mode == 'train': # Training시에만 적용, Validation 시에는 적용 안함
-                    # 스테이지2에만 해당하는 옵션
-                    # 컨디션 이미지가 타겟 이미지와 동일하게 들어감 -> 리컨 태스크도 동일하게 수행
-                    if random.random() < self.do_proxy_recon_task_prob: # 정해진 확률로 수행
-                        controlnet_img = img.copy()
-                if self.get_random_id_embed_every_step:
-                    # 동일한 ID 중에서 매번 랜덤 선택
-                    id = self.id_embed_paths[idx].split('/')[-3] # e.g. n000002
-                    id_candidates = self.id_embed_candidates_cache[id]
-                    # 자기 자신밖에 없을수도 있으니, 제외 처리 안하고 랜덤 선택
-                    selected_id_embed = random.choice(id_candidates) # e.g. .../n000002/masked_pulid_id/0001_01.npy
-                    face_id_embed = torch.Tensor(np.load(selected_id_embed))
-                    # src_img도 변경
-                    src_img = Image.open(os.path.join(self.dataset_path, id, os.path.basename(selected_id_embed).replace('.npy', '.jpg'))).convert('RGB')
-                else:
-                    face_id_embed = torch.Tensor(np.load(self.id_embed_paths[idx]))
-                    
-                if self.model.use_target_clip:
-                    with torch.no_grad():
-                        id_image = cv2.imread(self.src_img_list[idx])
-                        id_image = cv2.cvtColor(id_image, cv2.COLOR_BGR2RGB)
-                        id_image = resize_numpy_image_long(id_image, 1024)
-                        trg_image = cv2.imread(self.image_paths[idx])
-                        trg_image = cv2.cvtColor(trg_image, cv2.COLOR_BGR2RGB)
-                        trg_image = resize_numpy_image_long(trg_image, 1024)
-                        face_id_embed = self.model.transformer.get_id_embedding_(id_image, cal_uncond=True, trg_image=None)
-                    
-                    
-                gaze_embed = torch.Tensor(np.load(self.gaze_paths[idx])) if self.train_gaze else None
-                
+        # while True:
+        # try:
+        
+        # Processing
+        img = Image.open(self.image_paths[idx]).convert('RGB') # GT target
 
-                return {
-                    "src_img": src_img,
-                    "img": img,
-                    # "original_size": (original_height, original_width),
-                    # "prompt_embeds": prompt_embeds,
-                    # "pooled_prompt_embeds": pooled_prompt_embeds,
-                    "face_id_embed": face_id_embed,
-                    "uncond_id_embed": self.uncond_id_embed if not self.model.use_target_clip else torch.zeros_like(face_id_embed),
-                    # "drop_image_embed": drop_image_embed,
-                    'controlnet_img': controlnet_img,
-                    "gaze_embed": gaze_embed ,
-                }
+        if not self.pseudo and self.get_random_id_embed_every_step: # 1스테이지 전용, 랜덤 ID 임베딩 매 스텝마다 선택
+            # 동일한 ID 중에서 매번 랜덤 선택
+            # /workspace/jiwon/dataset/VGGFace2HQ/original/VGGface2_None_norm_512_true_bygfpgan/n000003/0002_01.jpg
+            id = self.image_paths[idx].split('/')[-2] # e.g. n000002
+            src_imgs = glob(os.path.join(self.dataset_path, id, '*.jpg'))
+            src_imgs = [p for p in src_imgs if os.path.basename(p) != os.path.basename(self.image_paths[idx])] # 자기 자신 제외
+            if self.mode == 'train':
+            # 자기 자신을 제외하고 동일 ID로 랜덤하게 Src 이미지 선택
+                selected_src_img = random.choice(src_imgs)
+            else:
+                if self.validation_with_other_src_id_embed :
+                    # test 시에는 자기 자신 제외한 다른 인물에서 선택
+                    id_list = os.listdir(self.dataset_path) # e.g. n000002
+                    id_list = [d for d in natsorted(id_list) if d != id] # 자기 자신 제외
+                    random.seed(idx) # Seed for reproducibility
+                    id = random.choice(id_list)
+                    src_imgs = natsorted(list(glob(os.path.join(self.dataset_path, id, '*.jpg'))))
+                # 고정으로 선택, 파일 체크하면서 있을때까지 증가
+                selected_src_img = None
+                for src_img_candidate in src_imgs:
+                    src_basename = os.path.basename(src_img_candidate).split('.')[0]
+                    mask_path = os.path.join(self.dataset_path, id, 'mask_intersection', f"{src_basename}.png")
+                    seg_path = os.path.join(self.dataset_path, id, 'segmap_intersection', f"{src_basename}.png")
+                    landmark_path = os.path.join(self.dataset_path, id, '3dmm', src_basename, f"{src_basename}_ldm68.png")
+                    iris_path = os.path.join(self.dataset_path, id, 'iris', f"{src_basename}.png")
+                    if os.path.exists(mask_path) and os.path.exists(seg_path) and os.path.exists(landmark_path) and os.path.exists(iris_path):
+                        selected_src_img = src_img_candidate
+                        break
+
+            trg_basename = os.path.basename(self.image_paths[idx]).split('.')[0] # e.g. 0001_01
+            trg_id = self.image_paths[idx].split('/')[-2] # e.g. n000002
+            seg_img = Image.open(os.path.join(self.dataset_path, trg_id, 'segmap_intersection', f"{trg_basename}.png")).convert('RGB')
+            landmark_img = Image.open(os.path.join(self.dataset_path, trg_id, '3dmm', trg_basename, f"{trg_basename}_ldm68.png")).convert('RGB')
+            iris_img = Image.open(os.path.join(self.dataset_path, trg_id, 'iris', f"{trg_basename}.png")).convert('RGB')
+            
+            
+            # ID 임베딩
+            src_img = Image.open(selected_src_img).convert('RGB')
+            src_basename = os.path.basename(selected_src_img).split('.')[0] # e.g. 0001_01
+            mask_img = Image.open(os.path.join(self.dataset_path, id, 'mask_intersection', f"{src_basename}.png")).convert('RGB')
+            id_image = cv2.imread(selected_src_img)
+            id_image = cv2.cvtColor(id_image, cv2.COLOR_BGR2RGB)
+            mask_np = np.array(mask_img)
+            masked_id_image = id_image * (mask_np / 255.0)
+            masked_id_image = masked_id_image.astype(np.uint8)
+            id_image = resize_numpy_image_long(masked_id_image, 1024)
+            face_id_embed = self.model.transformer.get_id_embedding_(id_image, cal_uncond=True, trg_image=None)
+            
+            # Condition
+            controlnet_img = create_condition_images(
+                image=img,
+                seg=seg_img,
+                mask=None,
+                landmark=landmark_img,
+                iris=iris_img,
+                condition=self.degradation_type, # 'blur' or 'downsample'
+                downsample_size=self.downsample_size,
+                blur_radius=self.blur_radius,
+            )['condition_blur_landmark_glass']
+            
+            controlnet_img = Image.fromarray(controlnet_img)
+            
+        else:
+            src_img_basename = os.path.basename(self.src_img_list[idx]).split('.')[0] # e.g. 0001_01
+            src_img = Image.open(self.src_img_list[idx]).convert('RGB')
+            face_id_embed = torch.Tensor(np.load(self.id_embed_paths[idx]))
+            controlnet_img = Image.open(self.controlnet_paths[idx]).convert('RGB')
+            
+            
+        if self.do_proxy_recon_task and self.mode == 'train': # Training시에만 적용, Validation 시에는 적용 안함
+            # 스테이지2에만 해당하는 옵션
+            # 컨디션 이미지가 타겟 이미지와 동일하게 들어감 -> 리컨 태스크도 동일하게 수행
+            if random.random() < self.do_proxy_recon_task_prob: # 정해진 확률로 수행
+                controlnet_img = img.copy()
 
             
-            except Exception as e:
-                print(f"[WARN] idx {idx} failed with error: {e}, retrying...")
-                idx = random.randint(0, self.__len__() - 1)
+        if self.model.use_target_clip:
+            with torch.no_grad():
+                id_image = cv2.imread(self.src_img_list[idx])
+                id_image = cv2.cvtColor(id_image, cv2.COLOR_BGR2RGB)
+                id_image = resize_numpy_image_long(id_image, 1024)
+                trg_image = cv2.imread(self.image_paths[idx])
+                trg_image = cv2.cvtColor(trg_image, cv2.COLOR_BGR2RGB)
+                trg_image = resize_numpy_image_long(trg_image, 1024)
+                face_id_embed = self.model.transformer.get_id_embedding_(id_image, cal_uncond=True, trg_image=None)
+                
+            
+            
+        gaze_embed = torch.Tensor(np.load(self.gaze_paths[idx])) if self.train_gaze else None
+        
+
+        return {
+            "src_img": src_img,
+            "img": img,
+            # "original_size": (original_height, original_width),
+            # "prompt_embeds": prompt_embeds,
+            # "pooled_prompt_embeds": pooled_prompt_embeds,
+            "face_id_embed": face_id_embed,
+            "uncond_id_embed": torch.zeros_like(face_id_embed) if (self.model.use_target_clip or self.get_random_id_embed_every_step) else self.uncond_id_embed,
+            # "drop_image_embed": drop_image_embed,
+            'controlnet_img': controlnet_img,
+            "gaze_embed": gaze_embed ,
+        }
+
+        
+        # except Exception as e:
+        #     print(f"[WARN] idx {idx} failed with error: {e}, retrying...")
+        #     idx = random.randint(0, self.__len__() - 1)
 
 
 class ImageConditionDataset(Dataset):
@@ -649,7 +742,7 @@ def test_function(model, save_path, file_name, test_dataset):
         if len(id_embed.shape) == 2: # Make batch size 1
             id_embed = id_embed.unsqueeze(0)
             
-        if model.use_target_clip:
+        if model.use_target_clip or model.get_random_id_embed_every_step:
             from torchvision.transforms.functional import normalize, resize
             from torchvision.transforms import InterpolationMode
             
@@ -683,7 +776,7 @@ def test_function(model, save_path, file_name, test_dataset):
                     trg_face_features_image.to(model.flux_pipe.dtype).to(model.flux_pipe.device), return_all_features=False, return_hidden=True, shuffle=False
                 )
                 id_cond = torch.cat([id_embed, id_cond_vit], dim=-1).to(model.flux_pipe.dtype).to(model.flux_pipe.device)  # (1, id_dim + vit_dim)
-                id_embed = model.transformer.pulid_encoder(id_cond, id_vit_hidden, trg_id_cond_vit)  
+                id_embed = model.transformer.pulid_encoder(id_cond, id_vit_hidden, trg_id_cond_vit if model.use_target_clip else None)  
                 # id_embed = model.transformer.pulid_encoder(id_cond, id_vit_hidden, None)  
             
         condition = Condition(condition_img, model.adapter_names[2], position_delta, position_scale)
@@ -839,6 +932,7 @@ def main():
         lpips_weight=training_config.get("lpips_weight", 1.0),
         lpips_loss_thres=training_config.get("lpips_loss_thres", 0.5),
         use_target_clip=training_config.get("use_target_clip", False),
+        get_random_id_embed_every_step=training_config["dataset"].get("get_random_id_embed_every_step", False), # 저장된 ID 이용할건지, 매 스텝마다 ID 임베딩 새로 계산할건지
     )
     
     train_dataset = dataset_class(
@@ -860,6 +954,9 @@ def main():
         pseudo_pick_thres=training_config["dataset"].get("pseudo_pick_thres",  None),
         do_proxy_recon_task=training_config["dataset"].get("do_proxy_recon_task", False),
         do_proxy_recon_task_prob=training_config["dataset"].get("do_proxy_recon_task_prob", 0.5),
+        degradation_type=training_config["dataset"].get("degradation_type", 'downsample'), # 'blur' or 'downsample'
+        blur_radius=training_config["dataset"].get("blur_radius", 64),
+        downsample_size=training_config["dataset"].get("downsample_size", 8),
         model=trainable_model,
 
     )
@@ -875,13 +972,16 @@ def main():
         id_from = training_config["dataset"].get("id_from", "original"),
         swapped_condition_type=training_config["dataset"].get("swapped_condition_type", None),
         id_embed_candidates_cache=id_embed_candidates_cache if cache_vgg and dataset_type == "vgg" else None,
-        get_random_id_embed_every_step= False, # no need for testing
+        get_random_id_embed_every_step= training_config["dataset"].get("get_random_id_embed_every_step", False), # no need for testing
         validation_with_other_src_id_embed = training_config["dataset"].get("validation_with_other_src_id_embed", False),
         aes_thres=training_config["dataset"].get("aes_thres", 5.5),
         pseudo_aes_thres=training_config["dataset"].get("pseudo_aes_thres", None),
         pseudo_pick_thres=training_config["dataset"].get("pseudo_pick_thres",  None),
         do_proxy_recon_task=training_config["dataset"].get("do_proxy_recon_task", False),
         do_proxy_recon_task_prob=training_config["dataset"].get("do_proxy_recon_task_prob", 0.5),
+        degradation_type=training_config["dataset"].get("degradation_type", 'downsample'), # 'blur' or 'downsample'
+        blur_radius=training_config["dataset"].get("blur_radius", 64),
+        downsample_size=training_config["dataset"].get("downsample_size", 8),
         model=trainable_model,
     )
 

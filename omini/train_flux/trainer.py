@@ -22,6 +22,8 @@ from torchvision import transforms
 import torchvision.transforms as TF
 import torchvision.transforms.functional as TFF
 import numpy as np
+from .blur import create_condition_images
+
 
 
 def get_rank():
@@ -84,6 +86,7 @@ class OminiModel(L.LightningModule):
         lpips_weight: float = 1.0,
         lpips_loss_thres: float = 0.5,
         use_target_clip: bool = False,
+        get_random_id_embed_every_step: bool = False,
     ):
         # Initialize the LightningModule
         super().__init__()
@@ -96,6 +99,7 @@ class OminiModel(L.LightningModule):
         
         # self.dtype = dtype
         self.use_target_clip = use_target_clip
+        self.get_random_id_embed_every_step = get_random_id_embed_every_step
 
         # Load the Flux pipeline
         print(f"[INFO] Local RANK : {get_rank()}")
@@ -407,7 +411,7 @@ class OminiModel(L.LightningModule):
             assert gaze_embed is not None, "[ERROR] Gaze embed is required for gaze training."
             
             
-        if self.use_target_clip:
+        if self.use_target_clip or self.get_random_id_embed_every_step:
             from torchvision.transforms.functional import normalize, resize
             from torchvision.transforms import InterpolationMode
             
@@ -434,7 +438,9 @@ class OminiModel(L.LightningModule):
                 trg_id_cond_vit, _ = self.transformer.clip_vision_model(
                     trg_face_features_image.to(self.flux_pipe.dtype).to(self.flux_pipe.device), return_all_features=False, return_hidden=True, shuffle=False
                 )
+            
             id_cond = torch.cat([id_embed, id_cond_vit], dim=-1).to(self.flux_pipe.dtype).to(self.flux_pipe.device)
+            
             # Check NaN before PULID encoder
             if torch.isnan(id_cond).any():
                 print("[ERROR] NaN detected in id_cond before PULID encoder")
@@ -448,7 +454,8 @@ class OminiModel(L.LightningModule):
                 print("[ERROR] NaN detected in trg_id_cond_vit before PULID encoder")
                 raise ValueError("NaN detected in trg_id_cond_vit before PULID encoder")
             # id_embed = self.transformer.pulid_encoder(id_cond, id_vit_hidden, None)
-            id_embed = self.transformer.pulid_encoder(id_cond, id_vit_hidden, trg_id_cond_vit)
+            
+            id_embed = self.transformer.pulid_encoder(id_cond, id_vit_hidden, trg_id_cond_vit if self.use_target_clip else None)
             
             # Check NaN
             if torch.isnan(id_embed).any():
