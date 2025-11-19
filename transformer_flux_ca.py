@@ -726,7 +726,7 @@ class FluxTransformer2DModelCA(
             else [('CUDAExecutionProvider', {'device_id': local_rank})]
         self.app = FaceAnalysis(name='antelopev2', root='.', providers=providers)
         self.app.prepare(ctx_id=local_rank, det_size=(640, 640))
-        self.handler_ante = insightface.model_zoo.get_model('./antelopev2/glintr100.onnx',
+        self.handler_ante = insightface.model_zoo.get_model('./models/antelopev2/glintr100.onnx',
                                                             providers=providers)
         self.handler_ante.prepare(ctx_id=local_rank)
 

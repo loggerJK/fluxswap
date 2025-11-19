@@ -127,7 +127,7 @@ def create_condition_images(
         w, h = image.size
         blurred_np = image.resize((downsample_size, downsample_size), Image.LANCZOS).resize((w, h), Image.LANCZOS)
         blurred_np = np.array(blurred_np)
-    elif condition is 'None':
+    elif condition == 'None':
         blurred_np = image_np
     else:
         raise ValueError(f"Unknown condition type: {condition}")

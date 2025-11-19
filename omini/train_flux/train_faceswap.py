@@ -24,6 +24,7 @@ diffusers.utils.logging.set_verbosity_error()
 import cv2
 from .blur import create_condition_images
 from natsort import natsorted
+from tqdm import tqdm
 
 
 '''
@@ -226,7 +227,7 @@ class VGGDataset(torch.utils.data.Dataset):
             dirname_list = [os.path.dirname(f).split('/')[-1] for f in img_list] # e.g. n000002, # Target
             basename_list = [os.path.basename(f).split('.')[0] for f in img_list] # e.g. 0001_01# Target
             img_list_checked = []
-            for num, (dirname, basename) in enumerate(zip(dirname_list, basename_list)):
+            for num, (dirname, basename) in tqdm(enumerate(zip(dirname_list, basename_list)), desc="Checking existence of required files", total=len(dirname_list)):
                 id = dirname # e.g. n000002
                 trg_basename = basename # e.g. 0001_01
                 mask_path = os.path.join(self.dataset_path, id, 'mask_intersection', f"{trg_basename}.png")
@@ -527,18 +528,21 @@ class VGGDataset(torch.utils.data.Dataset):
             face_id_embed = self.model.transformer.get_id_embedding_(id_image, cal_uncond=True, trg_image=None)
             
             # Condition
-            controlnet_img = create_condition_images(
-                image=img,
-                seg=seg_img,
-                mask=None,
-                landmark=landmark_img,
-                iris=iris_img,
-                condition=self.degradation_type, # 'blur' or 'downsample'
-                downsample_size=self.downsample_size,
-                blur_radius=self.blur_radius,
-            )['condition_blur_landmark_glass']
-            
-            controlnet_img = Image.fromarray(controlnet_img)
+            if self.degradation_type == 'None':
+                controlnet_img = img.copy()
+            else :
+                controlnet_img = create_condition_images(
+                    image=img,
+                    seg=seg_img,
+                    mask=None,
+                    landmark=landmark_img,
+                    iris=iris_img,
+                    condition=self.degradation_type, # 'blur' or 'downsample'
+                    downsample_size=self.downsample_size,
+                    blur_radius=self.blur_radius,
+                )['condition_blur_landmark_glass']
+                
+                controlnet_img = Image.fromarray(controlnet_img)
             
         else:
             src_img_basename = os.path.basename(self.src_img_list[idx]).split('.')[0] # e.g. 0001_01
